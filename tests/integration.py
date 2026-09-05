@@ -24,6 +24,11 @@ from run import HOSTS, running_network
 
 SOURCE_IP = HOSTS["h1"]["ip"].split("/", maxsplit=1)[0]
 DESTINATION_IP = "10.0.3.99"
+UNASSIGNED_IPS = {
+    "h1": "10.0.1.99",
+    "h2": "10.0.2.99",
+    "h3": "10.0.3.99",
+}
 SOURCE_PORT = 12000
 DESTINATION_PORT = 23000
 SWITCH_INTERFACES = tuple(f"s1-eth{port}" for port in (1, 2, 3))
@@ -54,25 +59,53 @@ def materialize(packet):
     return Ether(raw(packet))
 
 
+def ipv4_frame(ip_header, payload, source_name="h1"):
+    return materialize(
+        Ether(
+            src=HOSTS[source_name]["mac"],
+            dst=HOSTS[source_name]["switch_mac"],
+        )
+        / ip_header
+        / payload
+    )
+
+
+def non_barrier_packets(captured):
+    return [
+        packet
+        for packet in captured
+        if not (
+            ICMP in packet
+            and Raw in packet
+            and raw(packet[Raw]).startswith(b"p4-sketch-barrier-")
+        )
+    ]
+
+
 def flow_packet(
     protocol,
     phase,
     sequence,
     source_port=SOURCE_PORT,
     destination_port=DESTINATION_PORT,
+    source_name="h1",
+    source_ip=None,
+    destination_ip=DESTINATION_IP,
 ):
+    if source_ip is None:
+        source_ip = HOSTS[source_name]["ip"].split("/", maxsplit=1)[0]
     payload = (
         f"p4-sketch-{protocol}-{phase}-{sequence:03d}-".encode()
         + b"x" * 32
     )
     packet = (
         Ether(
-            src=HOSTS["h1"]["mac"],
-            dst=HOSTS["h1"]["switch_mac"],
+            src=HOSTS[source_name]["mac"],
+            dst=HOSTS[source_name]["switch_mac"],
         )
         / IP(
-            src=SOURCE_IP,
-            dst=DESTINATION_IP,
+            src=source_ip,
+            dst=destination_ip,
             ttl=64,
             id=0x1000 + sequence,
         )
@@ -93,23 +126,31 @@ def flow_packet(
     return materialize(packet / Raw(payload))
 
 
-def barrier_packet(identifier):
-    payload = f"p4-sketch-barrier-{identifier:04x}".encode() + b"b" * 24
-    packet = (
-        Ether(
-            src=HOSTS["h1"]["mac"],
-            dst=HOSTS["h1"]["switch_mac"],
+def barrier_packets(identifier, source_name):
+    source_ip = HOSTS[source_name]["ip"].split("/", maxsplit=1)[0]
+    sentinels = []
+    for ordinal, destination_name in enumerate(HOSTS):
+        token = identifier * len(HOSTS) + ordinal
+        payload = (
+            f"p4-sketch-barrier-{identifier:04x}-{destination_name}".encode()
+            + b"b" * 24
         )
-        / IP(
-            src=SOURCE_IP,
-            dst=HOSTS["h3"]["ip"].split("/", maxsplit=1)[0],
-            ttl=64,
-            id=0x7000 + identifier,
+        packet = (
+            Ether(
+                src=HOSTS[source_name]["mac"],
+                dst=HOSTS[source_name]["switch_mac"],
+            )
+            / IP(
+                src=source_ip,
+                dst=UNASSIGNED_IPS[destination_name],
+                ttl=64,
+                id=(0x7000 + token) & 0xFFFF,
+            )
+            / ICMP(type="echo-request", id=token & 0xFFFF, seq=1)
+            / Raw(payload)
         )
-        / ICMP(type="echo-request", id=identifier, seq=1)
-        / Raw(payload)
-    )
-    return materialize(packet), payload
+        sentinels.append((materialize(packet), destination_name, payload))
+    return sentinels
 
 
 def send_frames(host, frames):
@@ -136,31 +177,36 @@ def send_frames(host, frames):
         raise RuntimeError(f"packet sender failed: {detail}")
 
 
-def is_barrier_reply(packet, identifier, payload):
+def is_barrier_egress(packet, sentinel, destination_name, payload):
     return (
-        packet.sniffed_on == "s1-eth1"
+        packet.sniffed_on == f"s1-eth{HOSTS[destination_name]['port']}"
         and Ether in packet
-        and packet[Ether].src == HOSTS["h1"]["switch_mac"]
-        and packet[Ether].dst == HOSTS["h1"]["mac"]
+        and packet[Ether].src == HOSTS[destination_name]["switch_mac"]
+        and packet[Ether].dst == HOSTS[destination_name]["mac"]
         and IP in packet
-        and packet[IP].src == HOSTS["h3"]["ip"].split("/", maxsplit=1)[0]
-        and packet[IP].dst == SOURCE_IP
+        and packet[IP].src == sentinel[IP].src
+        and packet[IP].dst == sentinel[IP].dst
+        and packet[IP].id == sentinel[IP].id
         and ICMP in packet
-        and packet[ICMP].type == 0
-        and packet[ICMP].id == identifier
+        and packet[ICMP].type == 8
+        and packet[ICMP].id == sentinel[ICMP].id
         and packet[ICMP].seq == 1
         and Raw in packet
         and raw(packet[Raw]) == payload
     )
 
 
-def capture_batch(net, frames, identifier):
-    sentinel, sentinel_payload = barrier_packet(identifier)
+def capture_batch(net, frames, identifier, source_name="h1"):
+    sentinels = barrier_packets(identifier, source_name)
     ready = threading.Event()
     barrier_seen = threading.Event()
+    observed_egresses = set()
 
     def observe(packet):
-        if is_barrier_reply(packet, identifier, sentinel_payload):
+        for sentinel, destination_name, payload in sentinels:
+            if is_barrier_egress(packet, sentinel, destination_name, payload):
+                observed_egresses.add(destination_name)
+        if len(observed_egresses) == len(sentinels):
             barrier_seen.set()
 
     sniffer = AsyncSniffer(
@@ -175,15 +221,18 @@ def capture_batch(net, frames, identifier):
     try:
         if not ready.wait(timeout=3):
             raise RuntimeError("packet capture did not become ready")
-        send_frames(net.get("h1"), [*frames, sentinel])
+        send_frames(
+            net.get(source_name),
+            [*frames, *(sentinel for sentinel, _, _ in sentinels)],
+        )
         if not barrier_seen.wait(timeout=5):
             raise RuntimeError("packet-processing barrier was not observed")
     finally:
-        if sniffer.running:
+        if ready.is_set() and sniffer.running:
             captured = sniffer.stop()
         else:
-            sniffer.join()
-            captured = sniffer.results
+            sniffer.join(timeout=1)
+            captured = getattr(sniffer, "results", [])
     return list(captured)
 
 
@@ -204,54 +253,83 @@ class SketchIntegrationTest(unittest.TestCase):
         cls.registers = SketchRegisters()
         cls.barrier_identifier = 1
 
-    def capture(self, frames):
+    def capture(self, frames, source_name="h1"):
         identifier = self.__class__.barrier_identifier
         self.__class__.barrier_identifier += 1
-        return capture_batch(self.net, frames, identifier)
+        return capture_batch(self.net, frames, identifier, source_name)
 
-    def assert_forwarding(self, original, observed, transport):
-        expected = original.copy()
-        expected[Ether].src = HOSTS["h3"]["switch_mac"]
-        expected[Ether].dst = HOSTS["h3"]["mac"]
-        expected[IP].ttl -= 1
-        del expected[IP].chksum
-        expected = materialize(expected)
-
-        self.assertEqual(raw(observed), raw(expected))
-        self.assertEqual(observed[Ether].src, HOSTS["h3"]["switch_mac"])
-        self.assertEqual(observed[Ether].dst, HOSTS["h3"]["mac"])
-        self.assertEqual(observed[IP].src, original[IP].src)
-        self.assertEqual(observed[IP].dst, original[IP].dst)
-        self.assertEqual(observed[IP].proto, original[IP].proto)
-        self.assertEqual(observed[IP].ttl, original[IP].ttl - 1)
-        self.assertNotEqual(observed[IP].chksum, original[IP].chksum)
-        self.assertEqual(checksum(raw(observed[IP])[:20]), 0)
+    def assert_forwarding(
+        self,
+        original,
+        observed,
+        transport,
+        destination_name="h3",
+    ):
+        self.assert_ipv4_integrity(original, observed, destination_name)
         self.assertEqual(observed[transport].sport, original[transport].sport)
         self.assertEqual(observed[transport].dport, original[transport].dport)
         self.assertEqual(observed[transport].chksum, original[transport].chksum)
         self.assertEqual(raw(observed[transport].payload), raw(original[transport].payload))
-        self.assertEqual(
-            in4_chksum(observed[IP].proto, observed[IP], raw(observed[transport])),
-            0,
-        )
+        if transport is TCP or original[UDP].chksum != 0:
+            self.assertEqual(
+                in4_chksum(
+                    observed[IP].proto,
+                    observed[IP],
+                    raw(observed[transport]),
+                ),
+                0,
+            )
         if transport is TCP:
             self.assertEqual(observed[TCP].seq, original[TCP].seq)
             self.assertEqual(observed[TCP].ack, original[TCP].ack)
             self.assertEqual(observed[TCP].flags, original[TCP].flags)
             self.assertEqual(observed[TCP].window, original[TCP].window)
-        else:
-            self.assertNotEqual(original[UDP].chksum, 0)
 
-    def assert_batch_forwarding(self, originals, captured, transport):
+    def assert_ipv4_integrity(self, original, observed, destination_name):
+        expected = original.copy()
+        expected[Ether].src = HOSTS[destination_name]["switch_mac"]
+        expected[Ether].dst = HOSTS[destination_name]["mac"]
+        expected[IP].ttl -= 1
+        del expected[IP].chksum
+        expected = materialize(expected)
+
+        self.assertEqual(raw(observed), raw(expected))
+        self.assertEqual(
+            observed[Ether].src,
+            HOSTS[destination_name]["switch_mac"],
+        )
+        self.assertEqual(observed[Ether].dst, HOSTS[destination_name]["mac"])
+        self.assertEqual(observed[IP].src, original[IP].src)
+        self.assertEqual(observed[IP].dst, original[IP].dst)
+        self.assertEqual(observed[IP].proto, original[IP].proto)
+        self.assertEqual(observed[IP].ttl, original[IP].ttl - 1)
+        self.assertNotEqual(observed[IP].chksum, original[IP].chksum)
+        self.assertEqual(
+            checksum(raw(observed[IP])[: observed[IP].ihl * 4]),
+            0,
+        )
+
+    def assert_batch_forwarding(
+        self,
+        originals,
+        captured,
+        transport,
+        source_name="h1",
+        destination_name="h3",
+    ):
+        source_interface = f"s1-eth{HOSTS[source_name]['port']}"
+        destination_interface = f"s1-eth{HOSTS[destination_name]['port']}"
         expected_payloads = {raw(packet[transport].payload) for packet in originals}
         self.assertEqual(len(expected_payloads), len(originals))
-        flow_packets = [
-            packet
-            for packet in captured
-            if transport in packet
-            and raw(packet[transport].payload) in expected_payloads
-        ]
+        flow_packets = non_barrier_packets(captured)
         self.assertEqual(len(flow_packets), 2 * len(originals))
+        unexpected = [
+            (packet.sniffed_on, raw(packet).hex())
+            for packet in flow_packets
+            if transport not in packet
+            or raw(packet[transport].payload) not in expected_payloads
+        ]
+        self.assertFalse(unexpected, f"unexpected captured packets: {unexpected}")
 
         by_payload = {
             payload: [
@@ -269,14 +347,102 @@ class SketchIntegrationTest(unittest.TestCase):
             interfaces = Counter(packet.sniffed_on for packet in packets)
             self.assertEqual(
                 interfaces,
-                Counter({"s1-eth1": 1, "s1-eth3": 1}),
+                Counter({source_interface: 1, destination_interface: 1}),
                 f"payload {payload!r}: observed interfaces {interfaces}",
             )
-            ingress = next(packet for packet in packets if packet.sniffed_on == "s1-eth1")
-            egress = next(packet for packet in packets if packet.sniffed_on == "s1-eth3")
+            ingress = next(
+                packet for packet in packets if packet.sniffed_on == source_interface
+            )
+            egress = next(
+                packet
+                for packet in packets
+                if packet.sniffed_on == destination_interface
+            )
             original = originals_by_payload[payload]
             self.assertEqual(raw(ingress), raw(original))
-            self.assert_forwarding(original, egress, transport)
+            self.assert_forwarding(
+                original,
+                egress,
+                transport,
+                destination_name,
+            )
+
+    def assert_ipv4_forwarded_once(
+        self,
+        original,
+        captured,
+        source_name="h1",
+        destination_name="h3",
+    ):
+        matching = non_barrier_packets(captured)
+        source_interface = f"s1-eth{HOSTS[source_name]['port']}"
+        destination_interface = f"s1-eth{HOSTS[destination_name]['port']}"
+        interfaces = Counter(packet.sniffed_on for packet in matching)
+        self.assertEqual(
+            interfaces,
+            Counter({source_interface: 1, destination_interface: 1}),
+            f"observed interfaces {interfaces}",
+        )
+        ingress = next(
+            packet for packet in matching if packet.sniffed_on == source_interface
+        )
+        egress = next(
+            packet for packet in matching if packet.sniffed_on == destination_interface
+        )
+        self.assertEqual(raw(ingress), raw(original))
+
+        self.assert_ipv4_integrity(original, egress, destination_name)
+        return egress
+
+    def assert_ipv4_dropped_once(self, original, captured, source_name="h1"):
+        matching = non_barrier_packets(captured)
+        source_interface = f"s1-eth{HOSTS[source_name]['port']}"
+        interfaces = Counter(packet.sniffed_on for packet in matching)
+        self.assertEqual(
+            interfaces,
+            Counter({source_interface: 1}),
+            f"observed interfaces {interfaces}",
+        )
+        self.assertEqual(raw(matching[0]), raw(original))
+
+    def assert_sketch_unchanged(self, before, description):
+        after = self.registers.read_all()
+        changes = [
+            f"{row}[{index}]: expected {old}, observed {new}"
+            for row in SKETCH_ROWS
+            for index, (old, new) in enumerate(zip(before[row], after[row]))
+            if old != new
+        ]
+        self.assertFalse(changes, f"{description}: " + "; ".join(changes))
+
+    def assert_bypasses_sketch(
+        self,
+        packet,
+        description,
+        source_name="h1",
+        destination_name="h3",
+    ):
+        before = self.registers.reset_all()
+        captured = self.capture([packet], source_name)
+        egress = self.assert_ipv4_forwarded_once(
+            packet,
+            captured,
+            source_name,
+            destination_name,
+        )
+        self.assert_sketch_unchanged(before, description)
+        return egress
+
+    def assert_dropped_without_measurement(
+        self,
+        packet,
+        description,
+        source_name="h1",
+    ):
+        before = self.registers.reset_all()
+        captured = self.capture([packet], source_name)
+        self.assert_ipv4_dropped_once(packet, captured, source_name)
+        self.assert_sketch_unchanged(before, description)
 
     def assert_row_count(self, rows, expected_count, expected_indices=None):
         indices = []
@@ -392,6 +558,348 @@ class SketchIntegrationTest(unittest.TestCase):
                 sorted(expected.items()),
                 f"{row}: expected {sorted(expected.items())}, observed {observed}",
             )
+
+    def test_unmeasured_ipv4_packets_bypass_sketch(self):
+        icmp = ipv4_frame(
+            IP(
+                src=SOURCE_IP,
+                dst=DESTINATION_IP,
+                ttl=64,
+                id=0x5101,
+            ),
+            ICMP(type="echo-request", id=0x5101, seq=1)
+            / Raw(b"p4-sketch-icmp-bypass".ljust(32, b"i")),
+        )
+        other_protocol = ipv4_frame(
+            IP(
+                src=SOURCE_IP,
+                dst=DESTINATION_IP,
+                ttl=64,
+                id=0x5102,
+                proto=253,
+            ),
+            Raw(b"p4-sketch-protocol-bypass".ljust(40, b"p")),
+        )
+
+        for description, packet in (
+            ("ICMP packet", icmp),
+            ("IP protocol 253 packet", other_protocol),
+        ):
+            with self.subTest(description):
+                egress = self.assert_bypasses_sketch(packet, description)
+                if ICMP in packet:
+                    self.assertEqual(egress[ICMP].chksum, packet[ICMP].chksum)
+                    self.assertEqual(checksum(raw(egress[ICMP])), 0)
+                    self.assertEqual(raw(egress[ICMP].payload), raw(packet[ICMP].payload))
+
+    def test_ipv4_fragments_bypass_sketch(self):
+        datagram_id = 0x5201
+        first_payload = raw(
+            UDP(
+                sport=SOURCE_PORT,
+                dport=DESTINATION_PORT,
+                len=64,
+                chksum=0,
+            )
+        ) + b"p4-sketch-fragment-first".ljust(24, b"f")[:24]
+        last_payload = b"p4-sketch-fragment-last".ljust(32, b"l")
+        fragments = (
+            (
+                "first IPv4 fragment",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=datagram_id,
+                        proto=17,
+                        flags="MF",
+                        frag=0,
+                    ),
+                    Raw(first_payload),
+                ),
+            ),
+            (
+                "non-first IPv4 fragment",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=datagram_id,
+                        proto=17,
+                        frag=4,
+                    ),
+                    Raw(last_payload),
+                ),
+            ),
+        )
+
+        for description, packet in fragments:
+            with self.subTest(description):
+                egress = self.assert_bypasses_sketch(packet, description)
+                self.assertEqual(egress[IP].flags, packet[IP].flags)
+                self.assertEqual(egress[IP].frag, packet[IP].frag)
+                self.assertEqual(raw(egress[IP].payload), raw(packet[IP].payload))
+                if packet[IP].frag == 0:
+                    self.assertEqual(packet[UDP].chksum, 0)
+                    self.assertEqual(egress[UDP].chksum, 0)
+
+    def test_invalid_ipv4_and_route_miss_do_not_update_sketch(self):
+        ttl_packets = [
+            (
+                f"TTL {ttl}",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=ttl,
+                        id=0x5300 + ttl,
+                    ),
+                    UDP(sport=SOURCE_PORT, dport=DESTINATION_PORT)
+                    / Raw(f"p4-sketch-ttl-{ttl}".encode().ljust(32, b"t")),
+                ),
+            )
+            for ttl in (0, 1)
+        ]
+
+        valid_checksum = ipv4_frame(
+            IP(
+                src=SOURCE_IP,
+                dst=DESTINATION_IP,
+                ttl=64,
+                id=0x5310,
+            ),
+            UDP(sport=SOURCE_PORT, dport=DESTINATION_PORT)
+            / Raw(b"p4-sketch-bad-checksum".ljust(32, b"c")),
+        )
+        bad_checksum = valid_checksum.copy()
+        bad_checksum[IP].chksum ^= 0xFFFF
+        bad_checksum = materialize(bad_checksum)
+        self.assertNotEqual(checksum(raw(bad_checksum[IP])[:20]), 0)
+
+        options = ipv4_frame(
+            IP(
+                src=SOURCE_IP,
+                dst=DESTINATION_IP,
+                ttl=64,
+                id=0x5311,
+                options=b"\x01\x01\x01\x01",
+            ),
+            UDP(sport=SOURCE_PORT, dport=DESTINATION_PORT)
+            / Raw(b"p4-sketch-ip-options".ljust(32, b"o")),
+        )
+        self.assertEqual(options[IP].ihl, 6)
+        self.assertEqual(checksum(raw(options[IP])[:24]), 0)
+
+        route_miss = ipv4_frame(
+            IP(
+                src=SOURCE_IP,
+                dst="10.0.4.99",
+                ttl=64,
+                id=0x5312,
+            ),
+            UDP(sport=SOURCE_PORT, dport=DESTINATION_PORT)
+            / Raw(b"p4-sketch-route-miss".ljust(32, b"r")),
+        )
+
+        cases = [
+            *ttl_packets,
+            ("bad IPv4 checksum", bad_checksum),
+            ("IPv4 options", options),
+            ("route miss", route_miss),
+        ]
+        for description, packet in cases:
+            with self.subTest(description):
+                self.assert_dropped_without_measurement(packet, description)
+
+    def test_malformed_lengths_do_not_update_sketch(self):
+        cases = (
+            (
+                "IPv4 total length below header size",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5401,
+                        proto=253,
+                        len=19,
+                    ),
+                    Raw(b"p4-sketch-short-total-length".ljust(40, b"s")),
+                ),
+            ),
+            (
+                "IPv4 total length exceeds received packet",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5402,
+                        proto=253,
+                        len=100,
+                    ),
+                    Raw(b"p4-sketch-long-total-length".ljust(32, b"l")),
+                ),
+            ),
+            (
+                "UDP length disagrees with IPv4 length",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5403,
+                        len=60,
+                    ),
+                    UDP(
+                        sport=SOURCE_PORT,
+                        dport=DESTINATION_PORT,
+                        len=8,
+                    )
+                    / Raw(b"p4-sketch-udp-length".ljust(32, b"u")),
+                ),
+            ),
+            (
+                "UDP length below header size",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5404,
+                        len=27,
+                    ),
+                    UDP(
+                        sport=SOURCE_PORT,
+                        dport=DESTINATION_PORT,
+                        len=7,
+                    )
+                    / Raw(b"p4-sketch-short-udp".ljust(40, b"u")),
+                ),
+            ),
+            (
+                "TCP data offset below minimum",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5405,
+                    ),
+                    TCP(
+                        sport=SOURCE_PORT,
+                        dport=DESTINATION_PORT,
+                        seq=1,
+                        flags="R",
+                        dataofs=4,
+                    )
+                    / Raw(b"p4-sketch-tcp-offset".ljust(32, b"t")),
+                ),
+            ),
+            (
+                "TCP header exceeds IPv4 total length",
+                ipv4_frame(
+                    IP(
+                        src=SOURCE_IP,
+                        dst=DESTINATION_IP,
+                        ttl=64,
+                        id=0x5406,
+                        len=72,
+                    ),
+                    TCP(
+                        sport=SOURCE_PORT,
+                        dport=DESTINATION_PORT,
+                        seq=1,
+                        flags="R",
+                        dataofs=15,
+                    )
+                    / Raw(b"p4-sketch-long-tcp-header".ljust(32, b"t")),
+                ),
+            ),
+        )
+
+        for description, packet in cases:
+            with self.subTest(description):
+                header_length = packet[IP].ihl * 4
+                self.assertEqual(checksum(raw(packet[IP])[:header_length]), 0)
+                self.assert_dropped_without_measurement(packet, description)
+
+    def test_reverse_direction_is_a_distinct_flow(self):
+        source_port = 24000
+        destination_port = 34000
+        forward = flow_packet(
+            "udp",
+            "direction",
+            0,
+            source_port,
+            destination_port,
+            source_name="h1",
+            source_ip=UNASSIGNED_IPS["h1"],
+            destination_ip=UNASSIGNED_IPS["h3"],
+        )
+        reverse = flow_packet(
+            "udp",
+            "direction",
+            0,
+            destination_port,
+            source_port,
+            source_name="h3",
+            source_ip=UNASSIGNED_IPS["h3"],
+            destination_ip=UNASSIGNED_IPS["h1"],
+        )
+        self.assertEqual(forward[IP].id, reverse[IP].id)
+        self.assertEqual(forward[IP].len, reverse[IP].len)
+        self.assertEqual(forward[IP].chksum, reverse[IP].chksum)
+        self.assertEqual(forward[UDP].chksum, reverse[UDP].chksum)
+        self.assertEqual(raw(forward[UDP].payload), raw(reverse[UDP].payload))
+
+        before = self.registers.reset_all()
+        captured = self.capture([forward], "h1")
+        self.assert_batch_forwarding([forward], captured, UDP, "h1", "h3")
+        forward_indices, _ = self.flow_update(
+            before,
+            self.registers.read_all(),
+            "forward UDP flow",
+        )
+
+        before = self.registers.reset_all()
+        captured = self.capture([reverse], "h3")
+        self.assert_batch_forwarding([reverse], captured, UDP, "h3", "h1")
+        reverse_indices, _ = self.flow_update(
+            before,
+            self.registers.read_all(),
+            "reverse UDP flow",
+        )
+        self.assertNotEqual(forward_indices, reverse_indices)
+
+        self.registers.reset_all()
+        captured = self.capture([forward], "h1")
+        self.assert_batch_forwarding([forward], captured, UDP, "h1", "h3")
+        captured = self.capture([reverse], "h3")
+        self.assert_batch_forwarding([reverse], captured, UDP, "h3", "h1")
+        rows = self.registers.read_all()
+        for position, row in enumerate(SKETCH_ROWS):
+            expected = Counter((forward_indices[position], reverse_indices[position]))
+            self.assertEqual(
+                nonzero_cells(rows[row]),
+                sorted(expected.items()),
+                f"{row}: expected {sorted(expected.items())}",
+            )
+        self.assertEqual(sketch_estimate(rows, forward_indices), 1)
+        self.assertEqual(sketch_estimate(rows, reverse_indices), 1)
+
+    def test_udp_zero_checksum_is_preserved(self):
+        packet = flow_packet("udp", "zero-checksum", 0)
+        packet[UDP].chksum = 0
+        packet = materialize(packet)
+        self.assertEqual(packet[UDP].chksum, 0)
+
+        self.registers.reset_all()
+        captured = self.capture([packet])
+        self.assert_batch_forwarding([packet], captured, UDP)
+        self.assert_row_count(self.registers.read_all(), 1)
 
     def test_multiple_flow_estimates_and_heavy_hitters(self):
         indices = self.discover_flow_indices(
