@@ -2,7 +2,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -14,7 +13,7 @@ from scapy.packet import Raw
 from scapy.sendrecv import AsyncSniffer
 from scapy.utils import checksum
 
-from bmv2_registers import SKETCH_ROWS, SketchRegisters
+from bmv2_registers import COUNTER_MAX, SKETCH_ROWS, SketchRegisters
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +28,7 @@ SOURCE_PORT = 12000
 DESTINATION_PORT = 23000
 SWITCH_INTERFACES = tuple(f"s1-eth{port}" for port in (1, 2, 3))
 COLLISION_SEARCH_LIMIT = 32
+HEAVY_HITTER_THRESHOLD = 50
 
 MULTI_FLOW_COUNTS = (
     ("a", 20000, 30000, 100),
@@ -191,10 +191,14 @@ def nonzero_cells(values):
     return [(index, value) for index, value in enumerate(values) if value != 0]
 
 
+def sketch_estimate(rows, indices):
+    return min(rows[row][index] for row, index in zip(SKETCH_ROWS, indices))
+
+
 class SketchIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.network_context = running_network(50)
+        cls.network_context = running_network(HEAVY_HITTER_THRESHOLD)
         cls.net = cls.network_context.__enter__()
         cls.addClassCleanup(cls.network_context.__exit__, None, None, None)
         cls.registers = SketchRegisters()
@@ -289,44 +293,29 @@ class SketchIntegrationTest(unittest.TestCase):
                 f"{row}: expected only [{index}]={expected_count}, observed {observed}",
             )
             indices.append(index)
-        estimate = min(rows[row][index] for row, index in zip(SKETCH_ROWS, indices))
+        estimate = sketch_estimate(rows, indices)
         self.assertEqual(estimate, expected_count)
         return tuple(indices)
 
-    def wait_for_flow_update(self, previous, description):
-        deadline = time.monotonic() + 2
-        last_deltas = None
-        while time.monotonic() < deadline:
-            current = self.registers.read_all()
-            deltas = {}
-            for row in SKETCH_ROWS:
-                deltas[row] = [
-                    (index, after - before)
-                    for index, (before, after) in enumerate(
-                        zip(previous[row], current[row])
-                    )
-                    if after != before
-                ]
-            if all(
-                len(deltas[row]) == 1 and deltas[row][0][1] == 1
-                for row in SKETCH_ROWS
-            ):
-                indices = tuple(deltas[row][0][0] for row in SKETCH_ROWS)
-                estimate = min(
-                    current[row][index]
-                    for row, index in zip(SKETCH_ROWS, indices)
+    def flow_update(self, previous, current, description):
+        deltas = {}
+        for row in SKETCH_ROWS:
+            deltas[row] = [
+                (index, after - before)
+                for index, (before, after) in enumerate(
+                    zip(previous[row], current[row])
                 )
-                self.assertGreaterEqual(estimate, 1)
-                return indices, current
-            if any(
-                len(deltas[row]) > 1
-                or any(increment < 0 or increment > 1 for _, increment in deltas[row])
-                for row in SKETCH_ROWS
-            ):
-                self.fail(f"{description}: invalid register deltas {deltas}")
-            last_deltas = deltas
-            time.sleep(0.01)
-        self.fail(f"{description}: register update timed out; deltas {last_deltas}")
+                if after != before
+            ]
+        if not all(
+            len(deltas[row]) == 1 and deltas[row][0][1] == 1
+            for row in SKETCH_ROWS
+        ):
+            self.fail(f"{description}: expected one +1 per row, observed {deltas}")
+        indices = tuple(deltas[row][0][0] for row in SKETCH_ROWS)
+        estimate = sketch_estimate(current, indices)
+        self.assertGreaterEqual(estimate, 1)
+        return indices, current
 
     def observe_flow_indices(self, previous, source_port, destination_port, ordinal):
         packet = flow_packet(
@@ -336,9 +325,11 @@ class SketchIntegrationTest(unittest.TestCase):
             source_port,
             destination_port,
         )
-        send_frames(self.net.get("h1"), [packet])
-        return self.wait_for_flow_update(
+        captured = self.capture([packet])
+        self.assert_batch_forwarding([packet], captured, UDP)
+        return self.flow_update(
             previous,
+            self.registers.read_all(),
             f"UDP {SOURCE_IP}:{source_port} -> {DESTINATION_IP}:{destination_port}",
         )
 
@@ -402,12 +393,13 @@ class SketchIntegrationTest(unittest.TestCase):
                 f"{row}: expected {sorted(expected.items())}, observed {observed}",
             )
 
-    def test_multiple_flow_estimates_do_not_underestimate(self):
-        flow_keys = [
-            (source_port, destination_port)
-            for _, source_port, destination_port, _ in MULTI_FLOW_COUNTS
-        ]
-        indices = self.discover_flow_indices(flow_keys)
+    def test_multiple_flow_estimates_and_heavy_hitters(self):
+        indices = self.discover_flow_indices(
+            [
+                (source_port, destination_port)
+                for _, source_port, destination_port, _ in MULTI_FLOW_COUNTS
+            ]
+        )
         for position, row in enumerate(SKETCH_ROWS):
             row_indices = {flow_indices[position] for flow_indices in indices.values()}
             self.assertEqual(len(row_indices), len(MULTI_FLOW_COUNTS), row)
@@ -429,18 +421,104 @@ class SketchIntegrationTest(unittest.TestCase):
         rows = self.registers.read_all()
         self.assert_register_state(rows, MULTI_FLOW_COUNTS, indices)
 
+        classifications = {}
         for name, source_port, destination_port, actual in MULTI_FLOW_COUNTS:
             flow_indices = indices[(source_port, destination_port)]
-            estimate = min(
-                rows[row][index]
-                for row, index in zip(SKETCH_ROWS, flow_indices)
-            )
+            estimate = sketch_estimate(rows, flow_indices)
             self.assertGreaterEqual(
                 estimate,
                 actual,
                 f"flow {name}: estimate {estimate}, actual {actual}",
             )
             self.assertEqual(estimate, actual)
+            classifications[name] = estimate >= HEAVY_HITTER_THRESHOLD
+        self.assertEqual(
+            classifications,
+            {"a": True, "b": False, "c": False},
+        )
+
+    def test_heavy_hitter_threshold_boundary(self):
+        source_port = 22000
+        destination_port = 32000
+        self.registers.reset_all()
+        discovery = [
+            flow_packet(
+                "udp",
+                "heavy-discover",
+                0,
+                source_port,
+                destination_port,
+            )
+        ]
+        captured = self.capture(discovery)
+        self.assert_batch_forwarding(discovery, captured, UDP)
+        indices = self.assert_row_count(self.registers.read_all(), 1)
+
+        self.registers.reset_all()
+        below_threshold = [
+            flow_packet(
+                "udp",
+                "heavy-below",
+                sequence,
+                source_port,
+                destination_port,
+            )
+            for sequence in range(HEAVY_HITTER_THRESHOLD - 1)
+        ]
+        captured = self.capture(below_threshold)
+        self.assert_batch_forwarding(below_threshold, captured, UDP)
+        rows = self.registers.read_all()
+        self.assert_row_count(
+            rows,
+            HEAVY_HITTER_THRESHOLD - 1,
+            indices,
+        )
+        self.assertFalse(
+            sketch_estimate(rows, indices) >= HEAVY_HITTER_THRESHOLD
+        )
+
+        boundary = [
+            flow_packet(
+                "udp",
+                "heavy-boundary",
+                HEAVY_HITTER_THRESHOLD - 1,
+                source_port,
+                destination_port,
+            )
+        ]
+        captured = self.capture(boundary)
+        self.assert_batch_forwarding(boundary, captured, UDP)
+        rows = self.registers.read_all()
+        self.assert_row_count(rows, HEAVY_HITTER_THRESHOLD, indices)
+        self.assertTrue(
+            sketch_estimate(rows, indices) >= HEAVY_HITTER_THRESHOLD
+        )
+
+    def test_counters_saturate_without_wrapping(self):
+        self.registers.reset_all()
+        discovery = [flow_packet("udp", "saturation-discover", 0)]
+        captured = self.capture(discovery)
+        self.assert_batch_forwarding(discovery, captured, UDP)
+        indices = self.assert_row_count(self.registers.read_all(), 1)
+
+        self.registers.reset_all()
+        for row, index in zip(SKETCH_ROWS, indices):
+            self.registers.write_cell(row, index, COUNTER_MAX - 1)
+        self.assert_row_count(
+            self.registers.read_all(),
+            COUNTER_MAX - 1,
+            indices,
+        )
+
+        first = [flow_packet("udp", "saturation-first", 0)]
+        captured = self.capture(first)
+        self.assert_batch_forwarding(first, captured, UDP)
+        self.assert_row_count(self.registers.read_all(), COUNTER_MAX, indices)
+
+        second = [flow_packet("udp", "saturation-second", 1)]
+        captured = self.capture(second)
+        self.assert_batch_forwarding(second, captured, UDP)
+        self.assert_row_count(self.registers.read_all(), COUNTER_MAX, indices)
 
     def test_single_row_collision_uses_minimum(self):
         (
@@ -480,12 +558,8 @@ class SketchIntegrationTest(unittest.TestCase):
         shared_row = SKETCH_ROWS[collision_row]
         shared_index = indices_a[collision_row]
         self.assertEqual(rows[shared_row][shared_index], 15)
-        estimate_a = min(
-            rows[row][index] for row, index in zip(SKETCH_ROWS, indices_a)
-        )
-        estimate_b = min(
-            rows[row][index] for row, index in zip(SKETCH_ROWS, indices_b)
-        )
+        estimate_a = sketch_estimate(rows, indices_a)
+        estimate_b = sketch_estimate(rows, indices_b)
         self.assertEqual(estimate_a, 10)
         self.assertEqual(estimate_b, 5)
         self.assertGreaterEqual(estimate_a, 10)
