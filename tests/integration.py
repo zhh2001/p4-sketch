@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -27,13 +28,25 @@ DESTINATION_IP = "10.0.3.99"
 SOURCE_PORT = 12000
 DESTINATION_PORT = 23000
 SWITCH_INTERFACES = tuple(f"s1-eth{port}" for port in (1, 2, 3))
+COLLISION_SEARCH_LIMIT = 32
+
+MULTI_FLOW_COUNTS = (
+    ("a", 20000, 30000, 100),
+    ("b", 20001, 30073, 30),
+    ("c", 20002, 30146, 5),
+)
 
 _SEND_FRAMES = """
+import socket
 import sys
-from scapy.all import Ether, sendp
+import time
 
-frames = [Ether(bytes.fromhex(line)) for line in sys.stdin if line.strip()]
-sendp(frames, iface=sys.argv[1], inter=0.002, verbose=False)
+frames = [bytes.fromhex(line) for line in sys.stdin if line.strip()]
+with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as sock:
+    sock.bind((sys.argv[1], 0))
+    for frame in frames:
+        sock.send(frame)
+        time.sleep(0.002)
 """
 
 
@@ -41,7 +54,13 @@ def materialize(packet):
     return Ether(raw(packet))
 
 
-def flow_packet(protocol, phase, sequence):
+def flow_packet(
+    protocol,
+    phase,
+    sequence,
+    source_port=SOURCE_PORT,
+    destination_port=DESTINATION_PORT,
+):
     payload = (
         f"p4-sketch-{protocol}-{phase}-{sequence:03d}-".encode()
         + b"x" * 32
@@ -60,15 +79,15 @@ def flow_packet(protocol, phase, sequence):
     )
     if protocol == "tcp":
         packet /= TCP(
-            sport=SOURCE_PORT,
-            dport=DESTINATION_PORT,
+            sport=source_port,
+            dport=destination_port,
             seq=0x10203040 + sequence,
             ack=0x50607080,
             flags="PA",
             window=4096,
         )
     elif protocol == "udp":
-        packet /= UDP(sport=SOURCE_PORT, dport=DESTINATION_PORT)
+        packet /= UDP(sport=source_port, dport=destination_port)
     else:
         raise ValueError(f"unsupported protocol: {protocol}")
     return materialize(packet / Raw(payload))
@@ -83,7 +102,7 @@ def barrier_packet(identifier):
         )
         / IP(
             src=SOURCE_IP,
-            dst=HOSTS["h2"]["ip"].split("/", maxsplit=1)[0],
+            dst=HOSTS["h3"]["ip"].split("/", maxsplit=1)[0],
             ttl=64,
             id=0x7000 + identifier,
         )
@@ -124,7 +143,7 @@ def is_barrier_reply(packet, identifier, payload):
         and packet[Ether].src == HOSTS["h1"]["switch_mac"]
         and packet[Ether].dst == HOSTS["h1"]["mac"]
         and IP in packet
-        and packet[IP].src == HOSTS["h2"]["ip"].split("/", maxsplit=1)[0]
+        and packet[IP].src == HOSTS["h3"]["ip"].split("/", maxsplit=1)[0]
         and packet[IP].dst == SOURCE_IP
         and ICMP in packet
         and packet[ICMP].type == 0
@@ -172,7 +191,7 @@ def nonzero_cells(values):
     return [(index, value) for index, value in enumerate(values) if value != 0]
 
 
-class SingleFlowIntegrationTest(unittest.TestCase):
+class SketchIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.network_context = running_network(50)
@@ -226,10 +245,7 @@ class SingleFlowIntegrationTest(unittest.TestCase):
             packet
             for packet in captured
             if transport in packet
-            and packet[IP].src == SOURCE_IP
-            and packet[IP].dst == DESTINATION_IP
-            and packet[transport].sport == SOURCE_PORT
-            and packet[transport].dport == DESTINATION_PORT
+            and raw(packet[transport].payload) in expected_payloads
         ]
         self.assertEqual(len(flow_packets), 2 * len(originals))
 
@@ -276,6 +292,204 @@ class SingleFlowIntegrationTest(unittest.TestCase):
         estimate = min(rows[row][index] for row, index in zip(SKETCH_ROWS, indices))
         self.assertEqual(estimate, expected_count)
         return tuple(indices)
+
+    def wait_for_flow_update(self, previous, description):
+        deadline = time.monotonic() + 2
+        last_deltas = None
+        while time.monotonic() < deadline:
+            current = self.registers.read_all()
+            deltas = {}
+            for row in SKETCH_ROWS:
+                deltas[row] = [
+                    (index, after - before)
+                    for index, (before, after) in enumerate(
+                        zip(previous[row], current[row])
+                    )
+                    if after != before
+                ]
+            if all(
+                len(deltas[row]) == 1 and deltas[row][0][1] == 1
+                for row in SKETCH_ROWS
+            ):
+                indices = tuple(deltas[row][0][0] for row in SKETCH_ROWS)
+                estimate = min(
+                    current[row][index]
+                    for row, index in zip(SKETCH_ROWS, indices)
+                )
+                self.assertGreaterEqual(estimate, 1)
+                return indices, current
+            if any(
+                len(deltas[row]) > 1
+                or any(increment < 0 or increment > 1 for _, increment in deltas[row])
+                for row in SKETCH_ROWS
+            ):
+                self.fail(f"{description}: invalid register deltas {deltas}")
+            last_deltas = deltas
+            time.sleep(0.01)
+        self.fail(f"{description}: register update timed out; deltas {last_deltas}")
+
+    def observe_flow_indices(self, previous, source_port, destination_port, ordinal):
+        packet = flow_packet(
+            "udp",
+            f"probe-{ordinal}",
+            ordinal,
+            source_port,
+            destination_port,
+        )
+        send_frames(self.net.get("h1"), [packet])
+        return self.wait_for_flow_update(
+            previous,
+            f"UDP {SOURCE_IP}:{source_port} -> {DESTINATION_IP}:{destination_port}",
+        )
+
+    def discover_flow_indices(self, flows):
+        previous = self.registers.reset_all()
+        indices = {}
+        for ordinal, (source_port, destination_port) in enumerate(flows):
+            observed, previous = self.observe_flow_indices(
+                previous,
+                source_port,
+                destination_port,
+                ordinal,
+            )
+            indices[(source_port, destination_port)] = observed
+        return indices
+
+    def find_single_row_collision(self):
+        previous = self.registers.reset_all()
+        catalog = []
+        for candidate in range(COLLISION_SEARCH_LIMIT):
+            source_port = 20000 + candidate
+            destination_port = 30000 + ((candidate * 73) % 1000)
+            indices, previous = self.observe_flow_indices(
+                previous,
+                source_port,
+                destination_port,
+                candidate,
+            )
+            flow = (source_port, destination_port)
+            for earlier_flow, earlier_indices in catalog:
+                matching_rows = tuple(
+                    position
+                    for position, (left, right) in enumerate(
+                        zip(earlier_indices, indices)
+                    )
+                    if left == right
+                )
+                if len(matching_rows) == 1:
+                    return (
+                        earlier_flow,
+                        earlier_indices,
+                        flow,
+                        indices,
+                        matching_rows[0],
+                    )
+            catalog.append((flow, indices))
+        self.fail(
+            f"no exactly-one-row collision in {COLLISION_SEARCH_LIMIT} candidates: "
+            f"{catalog}"
+        )
+
+    def assert_register_state(self, rows, flows, indices):
+        for position, row in enumerate(SKETCH_ROWS):
+            expected = Counter()
+            for _, source_port, destination_port, count in flows:
+                expected[indices[(source_port, destination_port)][position]] += count
+            observed = nonzero_cells(rows[row])
+            self.assertEqual(
+                observed,
+                sorted(expected.items()),
+                f"{row}: expected {sorted(expected.items())}, observed {observed}",
+            )
+
+    def test_multiple_flow_estimates_do_not_underestimate(self):
+        flow_keys = [
+            (source_port, destination_port)
+            for _, source_port, destination_port, _ in MULTI_FLOW_COUNTS
+        ]
+        indices = self.discover_flow_indices(flow_keys)
+        for position, row in enumerate(SKETCH_ROWS):
+            row_indices = {flow_indices[position] for flow_indices in indices.values()}
+            self.assertEqual(len(row_indices), len(MULTI_FLOW_COUNTS), row)
+
+        self.registers.reset_all()
+        packets = [
+            flow_packet(
+                "udp",
+                f"multi-{name}",
+                sequence,
+                source_port,
+                destination_port,
+            )
+            for name, source_port, destination_port, count in MULTI_FLOW_COUNTS
+            for sequence in range(count)
+        ]
+        captured = self.capture(packets)
+        self.assert_batch_forwarding(packets, captured, UDP)
+        rows = self.registers.read_all()
+        self.assert_register_state(rows, MULTI_FLOW_COUNTS, indices)
+
+        for name, source_port, destination_port, actual in MULTI_FLOW_COUNTS:
+            flow_indices = indices[(source_port, destination_port)]
+            estimate = min(
+                rows[row][index]
+                for row, index in zip(SKETCH_ROWS, flow_indices)
+            )
+            self.assertGreaterEqual(
+                estimate,
+                actual,
+                f"flow {name}: estimate {estimate}, actual {actual}",
+            )
+            self.assertEqual(estimate, actual)
+
+    def test_single_row_collision_uses_minimum(self):
+        (
+            flow_a,
+            indices_a,
+            flow_b,
+            indices_b,
+            collision_row,
+        ) = self.find_single_row_collision()
+        self.assertEqual(
+            sum(left == right for left, right in zip(indices_a, indices_b)),
+            1,
+        )
+
+        flows = (
+            ("collision-a", *flow_a, 10),
+            ("collision-b", *flow_b, 5),
+        )
+        indices = {flow_a: indices_a, flow_b: indices_b}
+        self.registers.reset_all()
+        packets = [
+            flow_packet(
+                "udp",
+                name,
+                sequence,
+                source_port,
+                destination_port,
+            )
+            for name, source_port, destination_port, count in flows
+            for sequence in range(count)
+        ]
+        captured = self.capture(packets)
+        self.assert_batch_forwarding(packets, captured, UDP)
+        rows = self.registers.read_all()
+        self.assert_register_state(rows, flows, indices)
+
+        shared_row = SKETCH_ROWS[collision_row]
+        shared_index = indices_a[collision_row]
+        self.assertEqual(rows[shared_row][shared_index], 15)
+        estimate_a = min(
+            rows[row][index] for row, index in zip(SKETCH_ROWS, indices_a)
+        )
+        estimate_b = min(
+            rows[row][index] for row, index in zip(SKETCH_ROWS, indices_b)
+        )
+        self.assertEqual(estimate_a, 10)
+        self.assertEqual(estimate_b, 5)
+        self.assertGreaterEqual(estimate_a, 10)
+        self.assertGreaterEqual(estimate_b, 5)
 
     def exercise_protocol(self, protocol):
         transport = TCP if protocol == "tcp" else UDP
