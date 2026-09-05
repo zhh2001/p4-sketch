@@ -4,6 +4,9 @@
 const bit<16> ETHERTYPE_IPV4 = 0x0800;
 const bit<8> IP_PROTOCOL_TCP = 6;
 const bit<8> IP_PROTOCOL_UDP = 17;
+const bit<8> SKETCH_SALT0 = 0x11;
+const bit<8> SKETCH_SALT1 = 0x37;
+const bit<8> SKETCH_SALT2 = 0x9d;
 
 typedef bit<48> mac_addr_t;
 
@@ -55,7 +58,11 @@ struct headers_t {
     udp_t udp;
 }
 
-struct metadata_t { }
+struct metadata_t {
+    bit<32> estimate;
+    bit<32> threshold;
+    bit<1> is_heavy;
+}
 
 parser ParserImpl(
     packet_in packet,
@@ -125,6 +132,10 @@ control IngressImpl(
     inout metadata_t meta,
     inout standard_metadata_t standard_metadata)
 {
+    register<bit<32>>(256) sketch_row0;
+    register<bit<32>>(256) sketch_row1;
+    register<bit<32>>(256) sketch_row2;
+
     action drop() {
         mark_to_drop(standard_metadata);
     }
@@ -133,6 +144,102 @@ control IngressImpl(
         hdr.ethernet.dst_addr = dst_mac;
         hdr.ethernet.src_addr = src_mac;
         standard_metadata.egress_spec = port;
+    }
+
+    action set_threshold(bit<32> value) {
+        meta.threshold = value;
+    }
+
+    action update_sketch() {
+        bit<16> src_port;
+        bit<16> dst_port;
+        bit<32> index0;
+        bit<32> index1;
+        bit<32> index2;
+        bit<32> value0;
+        bit<32> value1;
+        bit<32> value2;
+
+        if (hdr.tcp.isValid()) {
+            src_port = hdr.tcp.src_port;
+            dst_port = hdr.tcp.dst_port;
+        } else {
+            src_port = hdr.udp.src_port;
+            dst_port = hdr.udp.dst_port;
+        }
+
+        // Per-row permutations give CRC32 distinct collision partitions.
+        hash(
+            index0,
+            HashAlgorithm.crc32,
+            (bit<32>) 0,
+            {
+                SKETCH_SALT0,
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr,
+                hdr.ipv4.protocol,
+                src_port,
+                dst_port
+            },
+            (bit<32>) 256);
+        hash(
+            index1,
+            HashAlgorithm.crc32,
+            (bit<32>) 0,
+            {
+                SKETCH_SALT1,
+                dst_port,
+                src_port,
+                hdr.ipv4.protocol,
+                hdr.ipv4.dst_addr,
+                hdr.ipv4.src_addr
+            },
+            (bit<32>) 256);
+        hash(
+            index2,
+            HashAlgorithm.crc32,
+            (bit<32>) 0,
+            {
+                SKETCH_SALT2,
+                hdr.ipv4.protocol,
+                src_port,
+                dst_port,
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr
+            },
+            (bit<32>) 256);
+
+        sketch_row0.read(value0, index0);
+        if (value0 != 0xffffffff) {
+            value0 = value0 + 1;
+        }
+        sketch_row0.write(index0, value0);
+
+        sketch_row1.read(value1, index1);
+        if (value1 != 0xffffffff) {
+            value1 = value1 + 1;
+        }
+        sketch_row1.write(index1, value1);
+
+        sketch_row2.read(value2, index2);
+        if (value2 != 0xffffffff) {
+            value2 = value2 + 1;
+        }
+        sketch_row2.write(index2, value2);
+
+        meta.estimate = value0;
+        if (value1 < meta.estimate) {
+            meta.estimate = value1;
+        }
+        if (value2 < meta.estimate) {
+            meta.estimate = value2;
+        }
+
+        if (meta.estimate >= meta.threshold) {
+            meta.is_heavy = 1;
+        } else {
+            meta.is_heavy = 0;
+        }
     }
 
     table ipv4_lpm {
@@ -145,6 +252,13 @@ control IngressImpl(
         }
         const default_action = drop();
         size = 64;
+    }
+
+    table sketch_config {
+        actions = {
+            @defaultonly set_threshold;
+        }
+        default_action = set_threshold(50);
     }
 
     apply {
@@ -181,6 +295,11 @@ control IngressImpl(
         }
 
         if (ipv4_lpm.apply().hit) {
+            if (hdr.tcp.isValid() || hdr.udp.isValid()) {
+                sketch_config.apply();
+                update_sketch();
+            }
+
             hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
         }
     }
