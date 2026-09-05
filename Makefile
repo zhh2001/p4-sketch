@@ -9,7 +9,7 @@ P4INFO := $(BUILD_DIR)/count_min_sketch.p4info.txtpb
 CONTROLLER := $(BUILD_DIR)/controller
 CONTROLLER_SOURCES := $(wildcard controller/*.go) go.mod go.sum
 
-.PHONY: build test clean
+.PHONY: build run test clean
 
 build: $(P4_JSON) $(P4INFO) $(CONTROLLER)
 
@@ -23,10 +23,14 @@ $(CONTROLLER): $(CONTROLLER_SOURCES)
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build -mod=readonly -trimpath -o $(CONTROLLER) ./controller
 
+run: build
+	sudo -- $(PYTHON) mininet/run.py
+
 test: build
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 	$(GO) test -mod=readonly ./...
 
 clean:
 	rm -rf -- $(BUILD_DIR)
+	rm -rf -- mininet/__pycache__
 	rm -rf -- tests/__pycache__
