@@ -29,6 +29,7 @@ run: build
 test: build
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 	$(GO) test -mod=readonly ./...
+	sudo -- $(PYTHON) -B tests/integration.py
 
 clean:
 	rm -rf -- $(BUILD_DIR)

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from mininet.cli import CLI
@@ -244,7 +245,8 @@ def configure_pipeline(threshold):
         raise RuntimeError(f"controller exited with status {error.returncode}") from error
 
 
-def run_network(threshold):
+@contextmanager
+def running_network(threshold):
     if os.geteuid() != 0:
         raise RuntimeError("Mininet must run as root")
     switch_binary = shutil.which("simple_switch_grpc")
@@ -265,10 +267,15 @@ def run_network(threshold):
             net.start()
             configure_hosts(net)
             configure_pipeline(threshold)
-            info("*** Network ready; ICMP is forwarded without sketch updates\n")
-            CLI(net)
+            yield net
         finally:
             net.stop()
+
+
+def run_network(threshold):
+    with running_network(threshold) as net:
+        info("*** Network ready; ICMP is forwarded without sketch updates\n")
+        CLI(net)
 
 
 def main():
