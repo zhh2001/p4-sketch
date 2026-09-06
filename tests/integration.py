@@ -5,7 +5,10 @@ import threading
 import unittest
 from collections import Counter
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import mininet.node as mininet_node
 from scapy.compat import raw
 from scapy.layers.inet import ICMP, IP, TCP, UDP, in4_chksum
 from scapy.layers.l2 import Ether
@@ -19,7 +22,8 @@ from bmv2_registers import COUNTER_MAX, SKETCH_ROWS, SketchRegisters
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "mininet"))
 
-from run import HOSTS, running_network
+import run as mininet_run
+from run import HOSTS, P4RUNTIME_PORT, THRIFT_PORT, port_is_listening, running_network
 
 
 SOURCE_IP = HOSTS["h1"]["ip"].split("/", maxsplit=1)[0]
@@ -244,6 +248,120 @@ def sketch_estimate(rows, indices):
     return min(rows[row][index] for row, index in zip(SKETCH_ROWS, indices))
 
 
+class RuntimeFailureCleanupTest(unittest.TestCase):
+    def test_configuration_failure_cleans_runtime(self):
+        ports = (P4RUNTIME_PORT, THRIFT_PORT)
+        interfaces = {
+            *(f"{name}-eth0" for name in HOSTS),
+            *(f"s1-eth{config['port']}" for config in HOSTS.values()),
+        }
+        self.assertFalse(
+            [port for port in ports if port_is_listening(port)],
+            "runtime ports must be free before the cleanup test",
+        )
+        self.assertFalse(
+            interfaces & {name for _, name in mininet_run.socket.if_nameindex()},
+            "Mininet interfaces must be absent before the cleanup test",
+        )
+
+        runtime = TemporaryDirectory(prefix="p4-sketch-failure-")
+        runtime_path = Path(runtime.name)
+        self.addCleanup(runtime.cleanup)
+        real_popen = subprocess.Popen
+        switch_path = Path(mininet_run.shutil.which("simple_switch_grpc")).resolve()
+        controller_path = mininet_run.CONTROLLER.resolve()
+        launched = []
+        started = []
+
+        def emergency_cleanup():
+            for _, process in reversed(launched):
+                if process.returncode is not None:
+                    continue
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                except ChildProcessError:
+                    pass
+            remaining_interfaces = interfaces & {
+                name for _, name in mininet_run.socket.if_nameindex()
+            }
+            for interface in sorted(remaining_interfaces):
+                subprocess.run(
+                    ["ip", "link", "delete", "dev", interface],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+
+        self.addCleanup(emergency_cleanup)
+
+        def record_popen(command, *args, **kwargs):
+            process = real_popen(command, *args, **kwargs)
+            launched.append((command, process))
+            if isinstance(command, (list, tuple)) and command:
+                executable = Path(command[0]).resolve()
+                if executable in (switch_path, controller_path):
+                    started.append((executable, process))
+            return process
+
+        with patch.object(
+            mininet_run.tempfile,
+            "TemporaryDirectory",
+            return_value=runtime,
+        ), patch.object(
+            mininet_run.subprocess,
+            "Popen",
+            side_effect=record_popen,
+        ), patch.object(
+            mininet_node,
+            "Popen",
+            side_effect=record_popen,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "controller exited with status 1",
+            ):
+                with running_network(0):
+                    self.fail("invalid threshold unexpectedly configured")
+
+        for executable in (switch_path, controller_path):
+            processes = [process for path, process in started if path == executable]
+            self.assertEqual(len(processes), 1, f"{executable.name} launch count")
+            process = processes[0]
+            self.assertIsNotNone(
+                process.returncode,
+                f"{executable.name} was not waited for",
+            )
+            self.assertFalse(
+                Path(f"/proc/{process.pid}").exists(),
+                f"{executable.name} process {process.pid} was not reaped",
+            )
+        remaining_children = [
+            (process.pid, command)
+            for command, process in launched
+            if process.returncode is None or Path(f"/proc/{process.pid}").exists()
+        ]
+        self.assertFalse(
+            remaining_children,
+            f"child processes remain after configuration failure: {remaining_children}",
+        )
+        self.assertFalse(runtime_path.exists(), "runtime directory was not removed")
+        self.assertFalse(
+            [port for port in ports if port_is_listening(port)],
+            "runtime port remains in use after configuration failure",
+        )
+        self.assertFalse(
+            interfaces & {name for _, name in mininet_run.socket.if_nameindex()},
+            "Mininet interface remains after configuration failure",
+        )
+
+
 class SketchIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -252,6 +370,13 @@ class SketchIntegrationTest(unittest.TestCase):
         cls.addClassCleanup(cls.network_context.__exit__, None, None, None)
         cls.registers = SketchRegisters()
         cls.barrier_identifier = 1
+        startup = cls.registers.read_all()
+        for row, values in startup.items():
+            for index, value in enumerate(values):
+                if value != 0:
+                    raise AssertionError(
+                        f"{row}[{index}]: expected 0 at startup, observed {value}"
+                    )
 
     def capture(self, frames, source_name="h1"):
         identifier = self.__class__.barrier_identifier
